@@ -11,6 +11,28 @@ import json
 import re
 import warnings
 from mmengine import Config
+import gc
+import os
+import shutil
+import time
+from datetime import datetime
+from math import pi
+
+import gradio as gr
+import numpy as np
+import torch
+import trimesh
+from PIL import Image
+
+from unik3d.models import UniK3D
+from unik3d.utils.camera import OPENCV, Fisheye624, Pinhole, Spherical
+import open3d as o3d
+
+import open3d as o3d # Should already be there from unik3d related imports
+from wis3d import Wis3D
+import matplotlib # For color_by_instance
+from scipy.spatial.transform import Rotation # For oriented_bbox_to_center_euler_extent
+from collections import Counter # For pcd_denoise_dbscan
 
 # OSDSUTILS imports (ensure osdsynth is in PYTHONPATH or installed)
 try:
@@ -27,6 +49,7 @@ try:
         post_process_mask, sort_detections_by_area
     )
     from osdsynth.processor.wrappers.ram import run_tagging_model
+    #from osdsynth.processor.wrappers.unik3d_demo import get_depth_model as get_unik3d_depth_model
     OSDSYNTH_AVAILABLE = True
 except ImportError as e:
     warnings.warn(f"Failed to import osdsynth components: {e}. Ensure osdsynth is correctly installed and in PYTHONPATH.")
@@ -51,7 +74,7 @@ except ImportError as e:
     # Dummy functions for wrappers if needed for parsing
     def convert_detections_to_dict(*args, **kwargs): return {}
     def convert_detections_to_list(*args, **kwargs): return []
-    # ... (add more dummies if parsing fails due to missing osdsynth parts)
+    def get_unik3d_depth_model(*args, **kwargs): return None
 
 
 # Hugging Face Transformers imports
@@ -62,9 +85,143 @@ except ImportError:
     HF_TRANSFORMERS_AVAILABLE = False
     warnings.warn("Hugging Face Transformers not found. LLM rephrasing will not be available.")
 
+# --- Helper functions for Point Cloud Processing and Visualization (Derived from pointcloud.py logic) ---
+
+def process_pcd_for_unik3d(cfg, pcd, run_dbscan=True):
+    """Process PointCloud: Denoise and Downsample for UniK3D output."""
+    if not pcd.has_points() or len(pcd.points) == 0:
+        return pcd
+
+    # Statistical outlier removal
+    # Scale for voxel_down_sample can be tricky. If points are already metric,
+    # fixed values might be better than scale-dependent ones if scale varies wildly.
+    # For now, let's use a small fixed voxel size for downsampling.
+    try:
+        # std_ratio default in O3D is 2.0. 1.2 is more aggressive.
+        pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=cfg.get("pcd_sor_neighbors", 20), 
+                                                std_ratio=cfg.get("pcd_sor_std_ratio", 1.5))
+    except RuntimeError as e:
+        # print(f"Warning: Statistical outlier removal failed: {e}")
+        pass # Continue with the original pcd if SOR fails
+
+    if not pcd.has_points() or len(pcd.points) == 0:
+        return pcd
+
+    # Voxel down-sampling
+    voxel_size = cfg.get("pcd_voxel_size", 0.01) # e.g., 1cm
+    if voxel_size > 0:
+        pcd = pcd.voxel_down_sample(voxel_size=voxel_size)
+
+    if not pcd.has_points() or len(pcd.points) == 0:
+        return pcd
+
+    if cfg.get("dbscan_remove_noise", True) and run_dbscan:
+        pcd = pcd_denoise_dbscan_for_unik3d(
+            pcd,
+            eps=cfg.get("dbscan_eps", 0.05), # eps might need adjustment based on point density
+            min_points=cfg.get("dbscan_min_points", 10)
+        )
+    return pcd
+
+def pcd_denoise_dbscan_for_unik3d(pcd: o3d.geometry.PointCloud, eps=0.05, min_points=10) -> o3d.geometry.PointCloud:
+    """Denoise PointCloud using DBSCAN for UniK3D output."""
+    if not pcd.has_points() or len(pcd.points) < min_points:
+        return pcd
+
+    try:
+        labels = np.array(pcd.cluster_dbscan(eps=eps, min_points=min_points, print_progress=False))
+    except RuntimeError as e:
+        # print(f"Warning: DBSCAN clustering failed: {e}")
+        return pcd # Return original pcd if clustering fails
+
+    counts = Counter(labels)
+    if -1 in counts:
+        del counts[-1]  # Remove noise label
+
+    if not counts:  # No clusters found
+        return o3d.geometry.PointCloud() # Return empty PCD
+
+    # Find the largest cluster
+    largest_cluster_label = counts.most_common(1)[0][0]
+    
+    # Select points belonging to the largest cluster
+    largest_cluster_indices = np.where(labels == largest_cluster_label)[0]
+    
+    if len(largest_cluster_indices) < min_points: # If largest cluster is too small
+        return o3d.geometry.PointCloud() # Return empty PCD
+
+    return pcd.select_by_index(largest_cluster_indices)
+
+
+def get_bounding_box_for_unik3d(cfg, pcd):
+    """Get Axis-Aligned and Oriented Bounding Box for UniK3D output."""
+    if not pcd.has_points() or len(pcd.points) < 3: # Need at least 3 points for OBB
+        # Return empty/default BBoxes if not enough points
+        aabb = o3d.geometry.AxisAlignedBoundingBox()
+        obb = o3d.geometry.OrientedBoundingBox()
+        return aabb, obb
+
+    axis_aligned_bbox = pcd.get_axis_aligned_bounding_box()
+    try:
+        # Robust=True can help with near-degenerate cases but might be slower
+        oriented_bbox = pcd.get_oriented_bounding_box(robust=cfg.get("obb_robust", True))
+    except RuntimeError:
+        # Fallback to AABB based OBB if robust OBB fails
+        # print("Oriented BBox computation failed, falling back.")
+        oriented_bbox = o3d.geometry.OrientedBoundingBox.create_from_axis_aligned_bounding_box(axis_aligned_bbox)
+    return axis_aligned_bbox, oriented_bbox
+
+
+def color_by_instance_for_unik3d(pcds):
+    """Assign unique colors to a list of PointClouds for UniK3D output."""
+    if not pcds:
+        return []
+    cmap = matplotlib.colormaps.get_cmap( "turbo") # Or any other preferred colormap
+    instance_colors = cmap(np.linspace(0, 1, len(pcds)))
+    colored_pcds = []
+    for i, pcd_original in enumerate(pcds):
+        if pcd_original.has_points():
+            pcd_copy = o3d.geometry.PointCloud(pcd_original) # Work on a copy
+            pcd_copy.colors = o3d.utility.Vector3dVector(
+                np.tile(instance_colors[i, :3], (len(pcd_copy.points), 1))
+            )
+            colored_pcds.append(pcd_copy)
+        else:
+            colored_pcds.append(o3d.geometry.PointCloud()) # Append empty if original was empty
+    return colored_pcds
+
+
+def oriented_bbox_to_center_euler_extent_for_unik3d(bbox_center, box_R, bbox_extent):
+    """Convert OBB parameters to center, Euler angles, and extent for UniK3D output."""
+    center = np.asarray(bbox_center)
+    extent = np.asarray(bbox_extent)
+    eulers = Rotation.from_matrix(box_R.copy()).as_euler("XYZ") # Default: extrinsic 'xyz'
+    return center, eulers, extent
+
+
+def axis_aligned_bbox_to_center_euler_extent_for_unik3d(min_coords, max_coords):
+    """Convert AABB parameters to center, Euler angles, and extent for UniK3D output."""
+    center = tuple((min_val + max_val) / 2.0 for min_val, max_val in zip(min_coords, max_coords))
+    eulers = (0.0, 0.0, 0.0) # AABB is axis-aligned
+    extent = tuple(abs(max_val - min_val) for min_val, max_val in zip(min_coords, max_coords))
+    return center, eulers, extent
+
+# --- End of Helper functions ---
 
 warnings.filterwarnings("ignore") # Suppress warnings
+def instantiate_model(model_name):
+    type_ = model_name[0].lower()
 
+    name = f"unik3d-vit{type_}"
+    model = UniK3D.from_pretrained(f"lpiccinelli/{name}")
+
+    # Set resolution level and interpolation mode as specified.
+    model.resolution_level = 9
+    model.interpolation_mode = "bilinear"
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device).eval()
+    return model
 # --- Helper functions ---
 def prepare_llm_prompts_from_facts(facts, detection_list):
     batched_instructions = []
@@ -146,7 +303,9 @@ Output:
 Now it's your turn!
 """
 
-class GeneralizedSceneGraphGenerator:
+
+class GeneralizedSceneGraphGenerator:    
+
     def __init__(self, config_path="config/v2_hf_qwen.py", device="cuda",
                  llm_model_name_hf=None, llm_device_hf="auto"):
         
@@ -162,7 +321,16 @@ class GeneralizedSceneGraphGenerator:
             raise ImportError("Failed to load osdsynth library.")
 
         self.segmenter = SegmentImage(self.cfg, self.logger, self.device)
-        self.reconstructor = PointCloudReconstruction(self.cfg, self.logger, self.device, init_models=True)
+        
+        # Initialize with unik3d using the new function
+        try:
+            self.logger.info("Initializing UniK3D model...")
+            self.unik3d_model = instantiate_model("Large")  # Example model size
+            self.logger.info("Successfully initialized UniK3D model")
+        except Exception as e:
+            self.logger.error(f"Failed to initialize UniK3D model: {e}")
+            raise RuntimeError("Could not initialize UniK3D model")
+
         self.captioner = CaptionImage(self.cfg, self.logger, self.device, init_lava=False)
         self.qa_prompter = QAPromptGenerator(self.cfg, self.logger, self.device)
         self.fact_prompter = FactPromptGenerator(self.cfg, self.logger, self.device)
@@ -208,6 +376,7 @@ class GeneralizedSceneGraphGenerator:
         os.makedirs(self.cfg.wis3d_folder, exist_ok=True)
         self.cfg.vis = self.cfg.get("vis", False)
 
+    unik3d_model = instantiate_model("Large") 
     def _override_config_and_reinit(self, **kwargs):
         reinit_segmenter = False
         reinit_reconstructor = False
@@ -238,8 +407,8 @@ class GeneralizedSceneGraphGenerator:
         if reinit_segmenter:
             self.segmenter = SegmentImage(self.cfg, self.logger, self.device)
         if reinit_reconstructor:
-            init_models_flag = self.reconstructor.perspective_fields_model is not None
-            self.reconstructor = PointCloudReconstruction(self.cfg, self.logger, self.device, init_models=init_models_flag)
+            init_models_flag = self.unik3d_model is not None
+            self.unik3d_model = instantiate_model("Large")  # Example model size
         if reinit_captioner:
             init_lava_flag = self.captioner.llava_processor is not None
             self.captioner = CaptionImage(self.cfg, self.logger, self.device, init_lava=init_lava_flag)
@@ -331,21 +500,145 @@ class GeneralizedSceneGraphGenerator:
     def _process_common(self, image_input, custom_vocabulary=None, **kwargs):
         self._override_config_and_reinit(**kwargs)
         image_bgr = self._load_image(image_input)
-        image_rgb_pil = Image.fromarray(cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB))
-        
+        image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+        # image_rgb_pil = Image.fromarray(image_rgb) # This PIL image is used for _get_object_classes
+
         filename_prefix = "processed_image_" + self.timestamp
         if isinstance(image_input, str):
-             filename_prefix = os.path.splitext(os.path.basename(image_input))[0] + "_" + self.timestamp
+            filename_prefix = os.path.splitext(os.path.basename(image_input))[0] + "_" + self.timestamp
+
+        # --- Segmentation ---
+        # _get_object_classes expects PIL image
+        object_classes = self._get_object_classes(Image.fromarray(image_rgb), custom_vocabulary)
+        detection_list_initial = self._segment_image(image_bgr, object_classes) # Returns list of dicts
+        if not detection_list_initial:
+            raise SkipImageException("Segmentation resulted in no initial detections.")
+
+        # --- UniK3D Point Cloud Generation ---
+        image_tensor = torch.from_numpy(image_rgb).permute(2, 0, 1).unsqueeze(0).float().to(self.device)
+        with torch.no_grad(): # Ensure no_grad for inference
+            outputs = self.unik3d_model.infer(image_tensor, camera=None, normalize=True)
+        # points_3d from UniK3D is typically (1, C, H, W) or (C, H, W) if C is spatial (x,y,z)
+        # Assuming UniK3D output 'points' is (1, 3, H, W) where 3 is (x,y,z)
+        points_3d_global = outputs["points"].squeeze().permute(1, 2, 0).cpu().numpy() # Shape: (H, W, 3)
+
+        # --- Wis3D Visualization Setup (if enabled) ---
+        wis3d_instance = None
+        if self.cfg.get("vis", False):
+            wis3d_instance = Wis3D(self.cfg.wis3d_folder, filename_prefix)
+            # Add global point cloud from UniK3D
+            # Ensure points_3d_global and image_rgb have compatible shapes for coloring
+            if points_3d_global.shape[:2] == image_rgb.shape[:2]:
+                wis3d_instance.add_point_cloud(
+                    vertices=points_3d_global.reshape((-1, 3)),
+                    colors=image_rgb.reshape(-1, 3), # Use original image colors
+                    name="unik3d_global_scene_pts"
+                )
+            else:
+                self.logger.warning("Global point cloud and image dimensions mismatch for Wis3D coloring.")
+
+        # --- Process each detection for 3D information ---
+        valid_detections = []
+        min_initial_pts = self.cfg.get("min_points_threshold", 20)
+        min_processed_pts = self.cfg.get("min_points_threshold_after_denoise", 10)
+        min_bbox_volume = self.cfg.get("bbox_min_volume_threshold", 1e-6)
+
+        for det_idx, det in enumerate(detection_list_initial):
+            # 'subtracted_mask' is expected to be (H, W) boolean from _segment_image
+            object_mask = det["subtracted_mask"] 
+            
+            if not np.any(object_mask): # Skip if mask is empty
+                self.logger.debug(f"Skipping det {det_idx} ({det.get('class_name', 'N/A')}) due to empty mask.")
+                continue
+
+            # Extract points and colors for the current object using its mask
+            obj_points_from_global = points_3d_global[object_mask]
+            obj_colors_from_global = image_rgb[object_mask] / 255.0 # Normalize colors to [0,1]
+
+            if len(obj_points_from_global) < min_initial_pts:
+                self.logger.debug(f"Skipping det {det_idx} ({det.get('class_name', 'N/A')}): "
+                                f"Too few initial points ({len(obj_points_from_global)} < {min_initial_pts}).")
+                continue
+                
+            # Perturb points slightly to avoid co-linearity issues for some o3d operations
+            obj_points_from_global += np.random.normal(0, self.cfg.get("pcd_perturb_std", 1e-3), obj_points_from_global.shape)
+
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(obj_points_from_global)
+            pcd.colors = o3d.utility.Vector3dVector(obj_colors_from_global)
+            
+            # Process the object's point cloud (denoise, downsample)
+            processed_pcd = process_pcd_for_unik3d(self.cfg, pcd)
+
+            if not processed_pcd.has_points() or len(processed_pcd.points) < min_processed_pts:
+                self.logger.debug(f"Skipping det {det_idx} ({det.get('class_name', 'N/A')}): "
+                                f"Too few points after processing ({len(processed_pcd.points)} < {min_processed_pts}).")
+                continue
+
+            # Get bounding boxes
+            axis_aligned_bbox, oriented_bbox = get_bounding_box_for_unik3d(self.cfg, processed_pcd)
+
+            if axis_aligned_bbox.is_empty() or axis_aligned_bbox.volume() < min_bbox_volume:
+                self.logger.debug(f"Skipping det {det_idx} ({det.get('class_name', 'N/A')}): "
+                                f"BBox volume too small ({axis_aligned_bbox.volume()}).")
+                continue
+                
+            det["pcd"] = processed_pcd # Store the processed PCD
+            det["axis_aligned_bbox"] = axis_aligned_bbox
+            det["oriented_bbox"] = oriented_bbox
+            # det["points3d"] = np.asarray(processed_pcd.points) # If raw numpy points are still needed elsewhere
+            # det["image_crop"] is from _segment_image, could be useful
+            valid_detections.append(det)
+
+        if not valid_detections:
+            raise SkipImageException("No valid 3D objects found after processing.")
+
+        # --- Wis3D Visualization for valid objects (if enabled) ---
+        if wis3d_instance and valid_detections:
+            object_pcds_for_vis = [d["pcd"] for d in valid_detections]
+            instance_colored_pcds = color_by_instance_for_unik3d(object_pcds_for_vis)
+
+            for i, det_data in enumerate(valid_detections):
+                obj_pcd_colored = instance_colored_pcds[i]
+                class_name = det_data.get("class_name", f"object_{i}")
+                
+                if obj_pcd_colored.has_points():
+                    wis3d_instance.add_point_cloud(
+                        vertices=np.asarray(obj_pcd_colored.points),
+                        colors=np.asarray(obj_pcd_colored.colors),
+                        name=f"{i:02d}_{class_name}_unik3d_pts"
+                    )
+
+                # Add BBoxes to Wis3D
+                aa_bbox = det_data["axis_aligned_bbox"]
+                if not aa_bbox.is_empty():
+                    aa_center, aa_eulers, aa_extent = axis_aligned_bbox_to_center_euler_extent_for_unik3d(
+                        aa_bbox.get_min_bound(), aa_bbox.get_max_bound()
+                    )
+                    wis3d_instance.add_boxes(
+                        positions=np.array([aa_center]), 
+                        eulers=np.array([aa_eulers]), 
+                        extents=np.array([aa_extent]), 
+                        name=f"{i:02d}_{class_name}_unik3d_aa_bbox"
+                    )
+                
+                or_bbox = det_data["oriented_bbox"]
+                # Check if oriented_bbox is valid (e.g. extent is not zero)
+                if not or_bbox.is_empty() and np.all(np.array(or_bbox.extent) > 1e-6):
+                    or_center, or_eulers, or_extent = oriented_bbox_to_center_euler_extent_for_unik3d(
+                        or_bbox.center, or_bbox.R, or_bbox.extent
+                    )
+                    wis3d_instance.add_boxes(
+                        positions=np.array([or_center]), 
+                        eulers=np.array([or_eulers]), 
+                        extents=np.array([or_extent]), 
+                        name=f"{i:02d}_{class_name}_unik3d_or_bbox"
+                    )
+
+        # --- Captioning (on valid detections that have 3D info) ---
+        captioned_detections = self.captioner.process_local_caption(valid_detections)
         
-        object_classes = self._get_object_classes(image_rgb_pil, custom_vocabulary)
-        detection_list = self._segment_image(image_bgr, object_classes)
-        if not detection_list:
-            raise SkipImageException("Segmentation resulted in no detections.")
-        detection_list = self.reconstructor.process(filename_prefix, image_bgr, detection_list)
-        if not detection_list:
-            raise SkipImageException("Reconstruction resulted in no valid 3D objects.")
-        detection_list = self.captioner.process_local_caption(detection_list)
-        return detection_list, filename_prefix
+        return captioned_detections, filename_prefix
 
     def generate_facts(self, image_input, custom_vocabulary=None, run_llm_rephrase=False, **kwargs):
         try:
@@ -653,7 +946,7 @@ if __name__ == "__main__":
             current_image_to_process,
             custom_vocabulary=None, 
             run_llm_rephrase=True,
-            vis=False # Set to True for Wis3D output
+            vis=True # Set to True for Wis3D output
         )
 
         if detections_f:

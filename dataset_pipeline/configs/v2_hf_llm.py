@@ -19,15 +19,28 @@ mask_area_threshold = 100
 mask_conf_threshold = 0.3
 max_bbox_area_ratio = 0.90
 skip_bg = False
+
+# Depth model configuration
+model_name = "Large"# Only use unik3d for depth estimation
+
+# Point cloud processing params
 min_points_threshold = 50
 min_points_threshold_after_denoise = 25
+bbox_min_volume_threshold = 1e-6 # Minimum volume for a bounding box to be considered valid
+pcd_perturb_std = 0.001 # Standard deviation for random perturbation of points
+
+pcd_sor_neighbors = 20 # Statistical Outlier Removal: number of neighbors
+pcd_sor_std_ratio = 1.5 # Statistical Outlier Removal: std ratio
+pcd_voxel_size = 0.01   # Voxel size for downsampling (e.g., 1cm). Set to 0 to disable.
+obb_robust = True # Use robust OBB calculation in Open3D
+
 downsample_voxel_size = 0.02
 dbscan_remove_noise = True
 dbscan_eps = 0.15
 dbscan_min_points = 15
 spatial_sim_type = "overlap"
 log_dir = "./demo_output_generalized_hf/logs"
-vis = False
+vis = True
 use_clip = False
 perspective_model_variant = "perspective_fields"
 
